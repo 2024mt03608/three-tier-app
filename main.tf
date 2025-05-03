@@ -1,17 +1,16 @@
+# Get project metadata using project_id
 data "google_project" "project" {
   project_id = var.project_id
 }
 
-# Removed the data block that was causing the error
-# data "google_secret_manager_secret_version" "db_password" {
-#   count   = var.database_type == "mysql" ? 1 : 0
-#   secret  = google_secret_manager_secret.db_password[0].name
-# }
-
+# Define local variables for container image paths and environment variables
 locals {
+  # Choose API image based on database type
   api_image = var.database_type == "mysql" ? "gcr.io/sic-container-repo/todo-api" : "gcr.io/sic-container-repo/todo-api-postgres:latest"
+  # Frontend image
   fe_image  = "gcr.io/sic-container-repo/todo-fe"
 
+  # Environment variables for PostgreSQL
   api_env_vars_postgresql = {
     redis_host = google_redis_instance.main.host
     db_host    = google_sql_database_instance.main.ip_address[0].ip_address
@@ -21,6 +20,7 @@ locals {
     redis_port = "6379"
   }
 
+  # Environment variables for MySQL
   api_env_vars_mysql = {
     REDISHOST  = google_redis_instance.main.host
     todo_host  = google_sql_database_instance.main.ip_address[0].ip_address
@@ -31,6 +31,7 @@ locals {
   }
 }
 
+# Enable required Google Cloud APIs for the project
 module "project-services" {
   source                      = "terraform-google-modules/project-factory/google//modules/project_services"
   version                     = "18.0.0"
@@ -53,20 +54,22 @@ module "project-services" {
   ]
 }
 
+# Create a service account for Cloud Run
 resource "google_service_account" "runsa" {
   project      = var.project_id
   account_id   = "${var.deployment_name}-run-sa"
   display_name = "Service Account for Cloud Run"
 }
 
+# Wait for IAM changes to propagate
 resource "null_resource" "wait_for_iam_propagation" {
   depends_on = [google_service_account.runsa]
-
   provisioner "local-exec" {
     command = "sleep 30"
   }
 }
 
+# Assign IAM roles to the Cloud Run service account
 resource "google_project_iam_member" "runsa_roles" {
   for_each = toset(var.run_roles_list)
   project  = data.google_project.project.number
@@ -74,6 +77,7 @@ resource "google_project_iam_member" "runsa_roles" {
   member   = "serviceAccount:${google_service_account.runsa.email}"
 }
 
+# Create a secret for MySQL DB password
 resource "google_secret_manager_secret" "db_password" {
   count     = var.database_type == "mysql" ? 1 : 0
   secret_id = "${var.deployment_name}-db-password"
@@ -83,17 +87,14 @@ resource "google_secret_manager_secret" "db_password" {
   }
 }
 
+# Add a version to the secret with actual password data
 resource "google_secret_manager_secret_version" "db_password" {
   count       = var.database_type == "mysql" ? 1 : 0
   secret      = google_secret_manager_secret.db_password[0].id
   secret_data = var.mysql_password
 }
 
-#data "google_secret_manager_secret_version" "db_password" {
- # count   = var.database_type == "mysql" ? 1 : 0
-  #secret  = google_secret_manager_secret.db_password[0].name
-#}
-
+# Create a VPC network
 resource "google_compute_network" "main" {
   provider                = google-beta
   name                    = "${var.deployment_name}-private-network"
@@ -101,6 +102,7 @@ resource "google_compute_network" "main" {
   project                 = var.project_id
 }
 
+# Reserve an internal IP range for VPC peering
 resource "google_compute_global_address" "main" {
   name          = "${var.deployment_name}-vpc-address"
   provider      = google-beta
@@ -111,6 +113,7 @@ resource "google_compute_global_address" "main" {
   project       = var.project_id
 }
 
+# Create a service networking connection for Cloud SQL and VPC
 resource "google_service_networking_connection" "main" {
   network                 = google_compute_network.main.self_link
   service                 = "servicenetworking.googleapis.com"
@@ -118,6 +121,7 @@ resource "google_service_networking_connection" "main" {
   depends_on              = [google_compute_network.main]
 }
 
+# Create a VPC connector for Cloud Run to access the VPC
 resource "google_vpc_access_connector" "main" {
   provider       = google-beta
   project        = var.project_id
@@ -129,11 +133,13 @@ resource "google_vpc_access_connector" "main" {
   depends_on     = [time_sleep.wait_before_destroying_network]
 }
 
+# Ensure the VPC network is not destroyed prematurely
 resource "time_sleep" "wait_before_destroying_network" {
   depends_on      = [google_compute_network.main]
   destroy_duration = "60s"
 }
 
+# Create a Redis cache instance
 resource "google_redis_instance" "main" {
   authorized_network      = google_compute_network.main.name
   connect_mode            = "DIRECT_PEERING"
@@ -150,10 +156,12 @@ resource "google_redis_instance" "main" {
   labels                  = var.labels
 }
 
+# Generate a random ID for unique DB instance name
 resource "random_id" "id" {
   byte_length = 2
 }
 
+# Create Cloud SQL database instance (MySQL or PostgreSQL)
 resource "google_sql_database_instance" "main" {
   name             = "${var.deployment_name}-db-${random_id.id.hex}"
   database_version = var.database_type == "mysql" ? "MYSQL_8_0" : "POSTGRES_14"
@@ -176,6 +184,7 @@ resource "google_sql_database_instance" "main" {
       zone = var.zone
     }
 
+    # Enable IAM DB auth for PostgreSQL
     dynamic "database_flags" {
       for_each = var.database_type == "postgresql" ? [1] : []
       content {
@@ -189,6 +198,7 @@ resource "google_sql_database_instance" "main" {
   depends_on          = [google_service_networking_connection.main]
 }
 
+# Create a DB user (IAM-based for PostgreSQL, static for MySQL)
 resource "google_sql_user" "main" {
   project        = var.project_id
   instance       = google_sql_database_instance.main.name
@@ -200,10 +210,11 @@ resource "google_sql_user" "main" {
     : "foo"
   )
 
-  type = var.database_type == "postgresql" ? "CLOUD_IAM_SERVICE_ACCOUNT" : null
+  type     = var.database_type == "postgresql" ? "CLOUD_IAM_SERVICE_ACCOUNT" : null
   password = var.database_type == "mysql" ? var.mysql_password : null
 }
 
+# Create a database named "todo"
 resource "google_sql_database" "database" {
   project         = var.project_id
   name            = "todo"
@@ -211,6 +222,7 @@ resource "google_sql_database" "database" {
   deletion_policy = "ABANDON"
 }
 
+# Deploy the backend (API) service to Cloud Run
 resource "google_cloud_run_service" "api" {
   name     = "${var.deployment_name}-api"
   provider = google-beta
@@ -223,6 +235,7 @@ resource "google_cloud_run_service" "api" {
       containers {
         image = local.api_image
 
+        # Inject appropriate environment variables
         dynamic "env" {
           for_each = var.database_type == "postgresql" ? local.api_env_vars_postgresql : local.api_env_vars_mysql
           content {
@@ -232,6 +245,7 @@ resource "google_cloud_run_service" "api" {
         }
       }
     }
+
     metadata {
       annotations = {
         "autoscaling.knative.dev/maxScale"         = "8"
@@ -249,10 +263,12 @@ resource "google_cloud_run_service" "api" {
   metadata {
     labels = var.labels
   }
+
   autogenerate_revision_name = true
   depends_on                 = [google_sql_user.main, google_sql_database.database]
 }
 
+# Deploy the frontend (FE) service to Cloud Run
 resource "google_cloud_run_service" "fe" {
   name     = "${var.deployment_name}-fe"
   location = var.region
@@ -272,6 +288,7 @@ resource "google_cloud_run_service" "fe" {
         }
       }
     }
+
     metadata {
       annotations = {
         "autoscaling.knative.dev/maxScale" = "8"
@@ -287,6 +304,7 @@ resource "google_cloud_run_service" "fe" {
   }
 }
 
+# Make the API publicly accessible
 resource "google_cloud_run_service_iam_member" "noauth_api" {
   location = google_cloud_run_service.api.location
   project  = google_cloud_run_service.api.project
@@ -295,6 +313,7 @@ resource "google_cloud_run_service_iam_member" "noauth_api" {
   member   = "allUsers"
 }
 
+# Make the frontend publicly accessible
 resource "google_cloud_run_service_iam_member" "noauth_fe" {
   location = google_cloud_run_service.fe.location
   project  = google_cloud_run_service.fe.project
@@ -302,4 +321,3 @@ resource "google_cloud_run_service_iam_member" "noauth_fe" {
   role     = "roles/run.invoker"
   member   = "allUsers"
 }
-
